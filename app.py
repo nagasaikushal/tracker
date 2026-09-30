@@ -1,5 +1,5 @@
 """
-Tracker — two-user Notion-style personal workspace for Streamlit.
+Tracker — private Notion-style personal workspace for Streamlit.
 
 Storage:
 - Preferred for Streamlit Community Cloud: Google Sheets via gspread.
@@ -8,7 +8,7 @@ Storage:
 
 Important:
 - No database is required.
-- Exactly two configured users are supported.
+- No authentication is required.
 - All records have stable UUIDs.
 """
 
@@ -197,83 +197,12 @@ st.markdown(CSS, unsafe_allow_html=True)
 
 
 # =============================================================================
-# AUTH
+# WORKSPACE
 # =============================================================================
 
-def load_users() -> dict[str, dict[str, str]]:
-    """
-    Reads exactly two users from [users] in Streamlit secrets.
-
-    Expected:
-        [users]
-        you = {name = "Kushal", password = "..."}
-        partner = {name = "Partner", password = "..."}
-    """
-    try:
-        raw = dict(st.secrets["users"])
-    except Exception:
-        return {}
-
-    result: dict[str, dict[str, str]] = {}
-    for username, value in raw.items():
-        if isinstance(value, str):
-            result[username] = {"name": username.title(), "password": value}
-        elif isinstance(value, dict) and value.get("password"):
-            result[username] = {
-                "name": str(value.get("name", username.title())),
-                "password": str(value["password"]),
-            }
-
-    return result
-
-
-USERS = load_users()
-
-if not USERS:
-    st.error(
-        "Authentication is not configured. Add a [users] section to "
-        ".streamlit/secrets.toml before running the app."
-    )
-    st.code(
-        '[users]\nyou = {name = "You", password = "CHANGE_ME"}\n'
-        'partner = {name = "Partner", password = "CHANGE_ME_TOO"}'
-    )
-    st.stop()
-
-if len(USERS) > 2:
-    st.warning("This app is designed for two users. Only the configured users are shown.")
-
-if "auth_user" not in st.session_state:
-    st.session_state.auth_user = None
-
-
-def login_page() -> None:
-    st.markdown(
-        '<div class="login"><h1>✅ Tracker</h1>'
-        '<p style="color:#8b90a3">Two-person private workspace</p></div>',
-        unsafe_allow_html=True,
-    )
-    with st.columns([1, 1, 1])[1]:
-        with st.form("login"):
-            username = st.selectbox("User", list(USERS.keys()))
-            password = st.text_input("Password", type="password")
-            if st.form_submit_button("Unlock", type="primary", width="stretch"):
-                user = USERS.get(username)
-                if user and __import__("hmac").compare_digest(
-                    password.encode(), user["password"].encode()
-                ):
-                    st.session_state.auth_user = username
-                    st.rerun()
-                else:
-                    st.error("Incorrect password.")
-
-
-if not st.session_state.auth_user:
-    login_page()
-    st.stop()
-
-USER = st.session_state.auth_user
-NAME = USERS[USER]["name"]
+# Single shared workspace: no login, passwords, or user accounts.
+USER = "workspace"
+NAME = "Tracker"
 
 
 # =============================================================================
@@ -371,11 +300,11 @@ def validate_record(sheet: str, record: dict[str, Any]) -> tuple[bool, str]:
     return True, ""
 
 
-def local_file(user: str) -> Path:
-    return LOCAL_DATA_DIR / f"{user}.json"
+def local_file(user: str = USER) -> Path:
+    return LOCAL_DATA_DIR / "tracker.json"
 
 
-def local_load(user: str) -> dict[str, list[dict[str, Any]]]:
+def local_load(user: str = USER) -> dict[str, list[dict[str, Any]]]:
     path = local_file(user)
     if not path.exists():
         return {sheet: [] for sheet in SHEETS}
@@ -392,14 +321,16 @@ def local_load(user: str) -> dict[str, list[dict[str, Any]]]:
         return {sheet: [] for sheet in SHEETS}
 
 
-def local_save(user: str, db: dict[str, list[dict[str, Any]]]) -> None:
+def local_save(user: str = USER, db: dict[str, list[dict[str, Any]]] | None = None) -> None:
+    if db is None:
+        db = {sheet: [] for sheet in SHEETS}
     path = local_file(user)
     payload = {
         sheet: [normalize_record(sheet, dict(r)) for r in rows]
         for sheet, rows in db.items()
     }
     # Atomic replacement: write a complete file, then swap it into place.
-    fd, tmp_name = tempfile.mkstemp(prefix=f"{user}-", suffix=".json", dir=LOCAL_DATA_DIR)
+    fd, tmp_name = tempfile.mkstemp(prefix="tracker-", suffix=".json", dir=LOCAL_DATA_DIR)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -421,15 +352,15 @@ def gs_book():
     return gs_client().open_by_key(str(st.secrets["spreadsheet_id"]))
 
 
-def gs_load(user: str) -> dict[str, list[dict[str, Any]]]:
+def gs_load(user: str = USER) -> dict[str, list[dict[str, Any]]]:
     book = gs_book()
     db = {sheet: [] for sheet in SHEETS}
 
     for sheet, schema in SHEETS.items():
         try:
-            ws = book.worksheet(f"{user}__{sheet}")
+            ws = book.worksheet(sheet)
         except Exception:
-            ws = book.add_worksheet(title=f"{user}__{sheet}", rows=100, cols=max(20, len(schema) + 1))
+            ws = book.add_worksheet(title=sheet, rows=100, cols=max(20, len(schema) + 1))
             ws.append_row(["_id"] + list(schema))
             continue
 
@@ -440,11 +371,13 @@ def gs_load(user: str) -> dict[str, list[dict[str, Any]]]:
     return db
 
 
-def gs_save(user: str, db: dict[str, list[dict[str, Any]]]) -> None:
+def gs_save(user: str = USER, db: dict[str, list[dict[str, Any]]] | None = None) -> None:
+    if db is None:
+        db = {sheet: [] for sheet in SHEETS}
     book = gs_book()
 
     for sheet, schema in SHEETS.items():
-        title = f"{user}__{sheet}"
+        title = sheet
         try:
             ws = book.worksheet(title)
         except Exception:
@@ -472,7 +405,7 @@ def seed_if_empty(db: dict[str, list[dict[str, Any]]]) -> bool:
 
 
 def load_db() -> dict[str, list[dict[str, Any]]]:
-    key = f"db_{USER}"
+    key = f"db"
     if key in st.session_state:
         return st.session_state[key]
 
@@ -644,7 +577,7 @@ def editor(
     cols = show or list(schema)
 
     # If the table is filtered, preserve a stable editor key.
-    editor_key = key or f"editor_{USER}_{sheet}_{'_'.join(cols)}"
+    editor_key = key or f"editor_{sheet}_{'_'.join(cols)}"
 
     edited = st.data_editor(
         visible[cols],
@@ -852,7 +785,7 @@ def home() -> None:
     )
 
     st.markdown(
-        f'<div class="hero"><h1>{greeting}, {esc(NAME)}</h1>'
+        f'<div class="hero"><h1>{greeting}</h1>'
         f'<p>{TODAY:%A, %d %B %Y}</p></div>',
         unsafe_allow_html=True,
     )
@@ -934,7 +867,7 @@ def today_habits() -> None:
         }
 
         for i, habit in enumerate(habit_names()):
-            key = f"today_habit_{USER}_{i}_{hashlib.sha1(habit.encode()).hexdigest()[:8]}"
+            key = f"today_habit_{i}_{hashlib.sha1(habit.encode()).hexdigest()[:8]}"
             st.checkbox(
                 habit,
                 value=habit in done,
@@ -1066,7 +999,7 @@ def habits() -> None:
         hide_index=True,
         width="stretch",
         disabled=["Day", "Done %"],
-        key=f"habits_grid_{USER}",
+        key=f"habits_grid",
         column_config={
             "Done %": st.column_config.ProgressColumn(
                 "Done %", min_value=0, max_value=100, format="%d%%"
@@ -1145,7 +1078,7 @@ def habits() -> None:
     )
 
     with st.expander("⚙️ Habit settings"):
-        editor("Habits", key=f"habits_settings_{USER}")
+        editor("Habits", key=f"habits_settings")
 
 
 def tasks_page() -> None:
@@ -1153,13 +1086,13 @@ def tasks_page() -> None:
     with st.expander("➕ Quick add"):
         quick_add(TODAY, "tasks")
 
-    areas = st.multiselect("Filter by area", AREAS, key=f"task_filter_{USER}")
+    areas = st.multiselect("Filter by area", AREAS, key=f"task_filter")
     mask = (lambda d: d["Area"].isin(areas)) if areas else None
 
     editor(
         "Tasks",
         mask=mask,
-        key=f"tasks_editor_{USER}_{'_'.join(areas)}",
+        key=f"tasks_editor_{'_'.join(areas)}",
         show=["Task", "Area", "Status", "Date", "Start", "End", "Deadline", "Minutes"],
     )
 
@@ -1306,7 +1239,7 @@ def study(area: str, rid: str, title: str) -> None:
         "Tasks",
         mask=lambda d: d["Area"] == area,
         defaults={"Area": area, "Status": "To do"},
-        key=f"study_{rid}_{USER}",
+        key=f"study_{rid}",
         show=[
             "Task", "Subject", "Topic", "Sub-topic", "Status",
             "Deadline", "Minutes", "Date", "Start", "End"
@@ -1328,22 +1261,22 @@ def work() -> None:
     with tabs[2]:
         study("Analytics", "da", "Data Analytics")
     with tabs[3]:
-        editor("Ideas", key=f"ideas_{USER}")
+        editor("Ideas", key=f"ideas")
     with tabs[4]:
-        editor("Projects", key=f"projects_{USER}")
+        editor("Projects", key=f"projects")
         st.markdown("##### Project tasks")
         editor(
             "Tasks",
             mask=lambda d: d["Area"] == "Project",
             defaults={"Area": "Project", "Status": "To do"},
-            key=f"project_tasks_{USER}",
+            key=f"project_tasks",
             show=[
                 "Task", "Project", "Status",
                 "Deadline", "Minutes", "Date", "Start", "End"
             ],
         )
     with tabs[5]:
-        editor("Random", key=f"random_{USER}")
+        editor("Random", key=f"random")
 
 
 def workout() -> None:
@@ -1398,7 +1331,7 @@ def workout() -> None:
             "Workout",
             mask=lambda d: d["Target"] == selected,
             defaults={"Target": selected},
-            key=f"workout_editor_{USER}_{hashlib.sha1(selected.encode()).hexdigest()[:10]}",
+            key=f"workout_editor_{hashlib.sha1(selected.encode()).hexdigest()[:10]}",
             show=["Exercise", "Sets", "Reps", "Kg", "Minutes", "Date", "Notes"],
         )
     else:
@@ -1421,7 +1354,7 @@ def wishlist() -> None:
         }]
         save_db(DB)
 
-    editor("Wishlist", key=f"wishlist_{USER}")
+    editor("Wishlist", key=f"wishlist")
 
 
 def jobs() -> None:
@@ -1434,7 +1367,7 @@ def jobs() -> None:
         c.markdown(stat(option, count), unsafe_allow_html=True)
 
     st.write("")
-    editor("Jobs", key=f"jobs_{USER}")
+    editor("Jobs", key=f"jobs")
 
 
 def week() -> None:
@@ -1506,17 +1439,15 @@ with st.sidebar:
     page = st.radio(
         "Go to",
         list(PAGES),
-        key=f"page_{USER}",
+        key=f"page",
         label_visibility="collapsed",
     )
     st.divider()
 
-    st.caption(f"Signed in as **{esc(NAME)}**")
-
     st.download_button(
         "⬇️ Download my Excel backup",
         data=export_excel(),
-        file_name=f"tracker_{USER}.xlsx",
+        file_name=f"tracker.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         width="stretch",
     )
@@ -1526,9 +1457,5 @@ with st.sidebar:
         if use_google_sheets()
         else "Storage: local JSON (safe for local development; configure Google Sheets for persistent cloud hosting)."
     )
-
-    if st.button("Log out", width="stretch"):
-        st.session_state.clear()
-        st.rerun()
 
 PAGES[page]()
