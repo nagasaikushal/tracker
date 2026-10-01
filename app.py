@@ -14,16 +14,13 @@ Important:
 
 from __future__ import annotations
 
-import calendar
 import datetime as dt
 import hashlib
 import hmac
 import html
-import json
 import math
 import os
 import re
-import tempfile
 import threading
 import time
 import uuid
@@ -32,7 +29,6 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
 # Supabase backend.
 try:
@@ -111,6 +107,7 @@ SHEETS = {
     "Roadmap": {
         "Roadmap": ("text", None), "Heading": ("text", None), "Sub": ("text", None),
         "Topic": ("text", None), "Done": ("text", None),
+        "Order": ("num", None),
     },
     "Habits": {"Habit": ("text", None), "Min": ("num", None)},
     "HabitLog": {"Date": ("text", None), "Habit": ("text", None), "Minutes": ("num", None)},
@@ -874,7 +871,35 @@ def normalize_record(sheet: str, record: dict[str, Any]) -> dict[str, Any]:
     out["_id"] = str(record.get("_id") or uuid.uuid4())
     if record.get("__owner"):
         out["__owner"] = str(record["__owner"])
+    if record.get("__created"):
+        out["__created"] = str(record["__created"])
     return _json_safe(out)
+
+
+def _blank(v: Any) -> bool:
+    """True for None / NaN / NaT / empty or whitespace-only strings."""
+    if v is None:
+        return True
+    try:
+        if pd.isna(v):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return str(v).strip() == ""
+
+
+def _public(rec: dict[str, Any]) -> dict[str, Any]:
+    """Record without internal bookkeeping keys (__owner, __created)."""
+    return {k: v for k, v in rec.items() if not str(k).startswith("__")}
+
+
+def _record_is_blank(sheet: str, rec: dict[str, Any]) -> bool:
+    return all(_blank(rec.get(c)) for c in SHEETS[sheet])
+
+
+def _can_modify(rec: dict[str, Any]) -> bool:
+    """Admin can modify everything; users only their own private records."""
+    return USER == "admin" or str(rec.get("__owner") or USER) == USER
 
 
 def validate_record(sheet: str, record: dict[str, Any]) -> tuple[bool, str]:
@@ -919,9 +944,13 @@ def _remote_row(record: dict[str, Any], owner: str | None = None) -> dict[str, A
     record_id = str(normalized.pop("_id", "") or uuid.uuid4())
     record_owner = str(owner or normalized.pop("__owner", "") or USER or "admin")
     normalized.pop("__owner", None)
+    created = normalized.pop("__created", None)
     # Final defensive sanitization: Supabase/PostgREST JSON encoding does
     # not accept NaN or +/-Infinity, even though pandas/NumPy can create them.
     normalized = _json_safe(normalized)
+    if created:
+        # Creation time keeps rows in insertion order after reloads/updates.
+        normalized["_created"] = str(created)
     return {
         "_id": record_id,
         "owner": record_owner,
@@ -937,7 +966,42 @@ def _decode_remote_row(sheet: str, row: dict[str, Any]) -> dict[str, Any]:
     record = dict(data)
     record["_id"] = str(row.get("_id") or uuid.uuid4())
     record["__owner"] = str(row.get("owner") or "admin")
+    if data.get("_created"):
+        record["__created"] = str(data["_created"])
     return normalize_record(sheet, record)
+
+
+# Progress/logs are private to each user. Definitions (Habits, Targets, ...) stay
+# admin-shared so every account sees the same habit list and workout targets.
+PER_USER_SHEETS = {"HabitLog", "Reminders", "WishNotes", "Roadmap"}
+
+
+def _fetch_all(client, table: str, owners: list[str]) -> list[dict[str, Any]]:
+    """Fetch every row for the given owners.
+
+    PostgREST returns at most 1000 rows per request by default, which silently
+    truncated large tables (the roadmap has ~800 rows per user). The first page is
+    fetched in natural order; only if it is full do we re-fetch with a stable
+    ordering and page through the rest.
+    """
+    page = 1000
+
+    def query():
+        return client.table(table).select("_id,owner,data").in_("owner", owners)
+
+    first = query().range(0, page - 1).execute().data or []
+    if len(first) < page:
+        return first
+
+    rows: list[dict[str, Any]] = []
+    start = 0
+    while True:
+        batch = query().order("_id").range(start, start + page - 1).execute().data or []
+        rows.extend(batch)
+        if len(batch) < page:
+            break
+        start += page
+    return rows
 
 
 def supabase_load(user: str | None = None) -> dict[str, list[dict[str, Any]]]:
@@ -948,14 +1012,13 @@ def supabase_load(user: str | None = None) -> dict[str, list[dict[str, Any]]]:
     snapshot = {}
 
     for sheet, table in SUPABASE_TABLES.items():
-        response = client.table(table).select("_id,owner,data").execute()
-        rows = response.data or []
-        visible_rows = [
-            row for row in rows
-            if str(row.get("owner") or "admin") == "admin"
-            or str(row.get("owner") or "admin") == user
-        ]
-        db[sheet] = [_decode_remote_row(sheet, row) for row in visible_rows]
+        owners = [user] if sheet in PER_USER_SHEETS else sorted({"admin", user})
+        rows = _fetch_all(client, table, owners)
+        decoded = [_decode_remote_row(sheet, row) for row in rows]
+        # Stable sort: rows created by this version keep insertion order;
+        # older rows (no timestamp) keep whatever order the database returned.
+        decoded.sort(key=lambda r: r.get("__created") or "")
+        db[sheet] = decoded
         snapshot[sheet] = {str(r["_id"]): dict(r) for r in db[sheet]}
 
     st.session_state["_supabase_snapshot"] = snapshot
@@ -973,6 +1036,7 @@ def supabase_save(
 
     client = supabase_client()
     previous = st.session_state.get("_supabase_snapshot", {})
+    blocked = 0
 
     for sheet, table in SUPABASE_TABLES.items():
         old_records = previous.get(sheet, {})
@@ -990,8 +1054,12 @@ def supabase_save(
             # A non-admin can only create/change their own private records.
             # Existing admin records remain shared and immutable to them.
             if user != "admin" and old and str(old.get("__owner")) == "admin":
+                if _public(record) != _public(old):
+                    blocked += 1
                 record = dict(old)
                 owner = "admin"
+            if old is None and not record.get("__created"):
+                record["__created"] = dt.datetime.now().isoformat(timespec="microseconds")
             record["__owner"] = owner
             record["_id"] = rid
             current_records[rid] = record
@@ -1001,6 +1069,7 @@ def supabase_save(
             for rid, old in old_records.items():
                 if str(old.get("__owner")) == "admin" and rid not in current_records:
                     current_records[rid] = dict(old)
+                    blocked += 1
 
         deleted_ids = []
         for rid, old in old_records.items():
@@ -1032,6 +1101,8 @@ def supabase_save(
         db[sheet] = list(current_records.values())
 
     st.session_state["_supabase_snapshot"] = previous
+    if blocked:
+        st.session_state["_blocked_notice"] = True
 
 
 def seed_if_empty(db: dict[str, list[dict[str, Any]]]) -> bool:
@@ -1039,6 +1110,26 @@ def seed_if_empty(db: dict[str, list[dict[str, Any]]]) -> bool:
     for sheet, defaults in DEFAULTS.items():
         if not db[sheet]:
             db[sheet] = [normalize_record(sheet, dict(r)) for r in defaults]
+            changed = True
+    return changed
+
+
+def _purge_blank_records(db: dict[str, list[dict[str, Any]]]) -> bool:
+    """Drop all-blank rows left behind by the old 'save on +' editor bug.
+
+    Roadmap is skipped on purpose: its un-converted JSON section rows decode to
+    blank records and must survive until roadmap_convert.sql has been run.
+    """
+    changed = False
+    for sheet, rows in db.items():
+        if sheet == "Roadmap":
+            continue
+        keep = [
+            r for r in rows
+            if not (_record_is_blank(sheet, r) and _can_modify(r))
+        ]
+        if len(keep) != len(rows):
+            db[sheet] = keep
             changed = True
     return changed
 
@@ -1059,13 +1150,18 @@ def load_db() -> dict[str, list[dict[str, Any]]]:
             st.exception(exc)
             st.stop()
 
+    changed = _purge_blank_records(db)
+
     # Seed the default starter data only from the admin account so defaults
     # become shared records instead of accidentally becoming private to a user.
     if USER == "admin" and seed_if_empty(db):
+        changed = True
+
+    if changed:
         try:
             supabase_save(USER, db)
         except Exception as exc:
-            st.error("Supabase connected, but initial data could not be saved.")
+            st.error("Supabase connected, but cleanup/initial data could not be saved.")
             st.exception(exc)
             st.stop()
 
@@ -1081,6 +1177,8 @@ def save_db(db: dict[str, list[dict[str, Any]]]) -> None:
             st.error("Could not save changes to Supabase.")
             st.exception(exc)
             st.stop()
+    # Lets the sidebar rebuild the Excel backup only when data actually changed.
+    st.session_state["_db_version"] = st.session_state.get("_db_version", 0) + 1
 
 
 DB = load_db()
@@ -1091,12 +1189,15 @@ DB = load_db()
 # =============================================================================
 
 def to_editor_df(sheet: str, rows: list[dict[str, Any]]) -> pd.DataFrame:
+    """Rows -> DataFrame for st.data_editor. Carries a hidden `_id` column so
+    edited rows are matched to records by identity, never by position."""
     schema = SHEETS[sheet]
     data = []
 
     for row in rows:
         r = normalize_record(sheet, row)
-        item = {c: r.get(c, "") for c in schema}
+        item = {"_id": r["_id"]}
+        item.update({c: r.get(c, "") for c in schema})
 
         for c, (kind, _) in schema.items():
             if kind == "date":
@@ -1106,64 +1207,43 @@ def to_editor_df(sheet: str, rows: list[dict[str, Any]]) -> pd.DataFrame:
                     item[c] = None
             elif kind == "time":
                 try:
-                    item[c] = dt.datetime.strptime(str(item[c]), "%H:%M").time() if item[c] else None
+                    # accepts "HH:MM" and "HH:MM:SS"
+                    item[c] = dt.datetime.strptime(str(item[c])[:5], "%H:%M").time() if item[c] else None
                 except Exception:
                     item[c] = None
             elif kind == "num":
-                if item[c] in ("", None):
+                try:
+                    item[c] = None if item[c] in ("", None) else float(item[c])
+                except Exception:
                     item[c] = None
-                else:
-                    try:
-                        item[c] = float(item[c])
-                    except Exception:
-                        item[c] = None
 
         data.append(item)
 
-    # CRITICAL: always reset the index before passing data to st.data_editor.
-    # This avoids several historical data_editor index/update bugs.
-    return pd.DataFrame(data, columns=list(schema)).reset_index(drop=True)
+    # Always reset the index before passing data to st.data_editor.
+    return pd.DataFrame(data, columns=["_id"] + list(schema)).reset_index(drop=True)
 
 
-def from_editor_df(sheet: str, df: pd.DataFrame) -> list[dict[str, Any]]:
-    schema = SHEETS[sheet]
-    result = []
+def sort_tasks_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Order tasks by date, then start time. Undated / untimed tasks go last."""
+    if df.empty:
+        return df.reset_index(drop=True)
+    d = df.copy()
 
-    for _, row in df.reset_index(drop=True).iterrows():
-        record = {}
-        for c, (kind, _) in schema.items():
-            value = row.get(c, "")
+    def date_key(x):
+        return x.isoformat() if isinstance(x, dt.date) and not _blank(x) else "9999-99-99"
 
-            if pd.isna(value):
-                value = ""
+    def time_key(x):
+        if _blank(x):
+            return "99:99"
+        return x.strftime("%H:%M") if isinstance(x, dt.time) else str(x)[:5]
 
-            if kind == "date":
-                value = "" if value == "" else (
-                    value.isoformat() if isinstance(value, (dt.date, dt.datetime))
-                    else str(value)
-                )
-            elif kind == "time":
-                value = "" if value == "" else (
-                    value.strftime("%H:%M") if isinstance(value, dt.time)
-                    else str(value)[:5]
-                )
-            elif kind == "num":
-                if value == "":
-                    value = ""
-                else:
-                    try:
-                        n = float(value)
-                        value = int(n) if n.is_integer() else n
-                    except Exception:
-                        value = ""
-            else:
-                value = str(value)
-
-            record[c] = value
-
-        result.append(record)
-
-    return result
+    d["_kd"] = d["Date"].apply(date_key)
+    d["_kt"] = d["Start"].apply(time_key)
+    return (
+        d.sort_values(["_kd", "_kt"], kind="stable")
+        .drop(columns=["_kd", "_kt"])
+        .reset_index(drop=True)
+    )
 
 
 def column_config_for(sheet: str, columns: list[str]) -> dict[str, Any]:
@@ -1199,17 +1279,6 @@ def column_config_for(sheet: str, columns: list[str]) -> dict[str, Any]:
     return result
 
 
-def filtered_rows(sheet: str, mask=None) -> list[dict[str, Any]]:
-    rows = DB[sheet]
-    if mask is None:
-        return rows
-
-    df = to_editor_df(sheet, rows)
-    keep = mask(df)
-    ids = set(df.loc[keep, :].index)
-    return [r for i, r in enumerate(rows) if i in ids]
-
-
 def editor(
     sheet: str,
     mask=None,
@@ -1217,97 +1286,104 @@ def editor(
     show: list[str] | None = None,
     key: str | None = None,
 ) -> None:
+    """Editable table backed by DB[sheet].
+
+    Fixes over the previous version:
+      * rows are matched by a hidden `_id`, not by position, so deleting row 1
+        deletes row 1 (and not whatever happens to shift into its place);
+      * the blank row created by clicking "+" is never saved, so typing into it
+        no longer needs to be done twice;
+      * after a real save the widget key is bumped so the editor re-baselines
+        from the database (and re-sorts Tasks by time).
+    """
     schema = SHEETS[sheet]
-    full_df = to_editor_df(sheet, DB[sheet])
-
-    if mask is None:
-        visible = full_df.copy()
-        hidden_df = full_df.iloc[0:0].copy()
-        visible_original_indices = list(range(len(full_df)))
-    else:
-        keep = mask(full_df)
-        visible = full_df.loc[keep].copy().reset_index(drop=True)
-        hidden_df = full_df.loc[~keep].copy()
-        visible_original_indices = list(full_df.index[keep])
-
     cols = show or list(schema)
+    defaults = dict(defaults or {})
+    if sheet == "Tasks":
+        defaults.setdefault("Status", "To do")
 
-    # If the table is filtered, preserve a stable editor key.
-    editor_key = key or f"editor_{sheet}_{'_'.join(cols)}"
+    base_key = key or f"editor_{sheet}_{'_'.join(cols)}"
+    ver_key = f"{base_key}__ver"
+    ver = st.session_state.get(ver_key, 0)
+
+    full_df = to_editor_df(sheet, DB[sheet])
+    if full_df.empty:
+        keep = pd.Series([], dtype=bool)
+    else:
+        # Never show all-blank leftovers from the old bug.
+        is_blank = full_df[list(schema)].apply(lambda col: col.map(_blank)).all(axis=1)
+        keep = ~is_blank
+        if mask is not None:
+            keep = keep & mask(full_df).astype(bool)
+
+    visible = full_df[keep]
+    if sheet == "Tasks":
+        visible = sort_tasks_df(visible)
+    visible = visible.reset_index(drop=True)
 
     edited = st.data_editor(
-        visible[cols],
+        visible[["_id"] + cols],
         num_rows="dynamic",
         width="stretch",
         hide_index=True,
-        key=editor_key,
-        column_config=column_config_for(sheet, cols),
+        key=f"{base_key}_{ver}",
+        disabled=["_id"],
+        column_config={"_id": None, **column_config_for(sheet, cols)},
     )
 
-    edited = edited.reset_index(drop=True)
+    old_by_id = {str(r.get("_id")): r for r in DB[sheet]}
+    visible_ids = set(visible["_id"].astype(str))
+    new_visible: list[dict[str, Any]] = []
 
-    # Restore hidden columns from the original visible rows.
-    full_visible = pd.DataFrame(
-        [dict(r) for r in visible.to_dict("records")],
-        columns=cols
-    )
+    for _, row in edited.reset_index(drop=True).iterrows():
+        rid = None if _blank(row.get("_id")) else str(row["_id"])
+        old = old_by_id.get(rid) if rid else None
 
-    if defaults:
-        for c, default in defaults.items():
-            if c not in full_visible.columns:
-                full_visible[c] = default
+        rec = {c: row.get(c) for c in cols}
+
+        # Skip the empty row that appears right after clicking "+".
+        if all(_blank(rec.get(c)) for c in cols if c not in defaults):
+            continue
+
+        merged = dict(old) if old else {}
+        merged.update(rec)
+        for c, d in defaults.items():          # includes hidden columns (e.g. Workout.Target)
+            if _blank(merged.get(c)):
+                merged[c] = d
+        merged["_id"] = rid or str(uuid.uuid4())
+
+        if sheet == "Tasks":
+            old_status = str((old or {}).get("Status", ""))
+            if str(merged.get("Status", "")) == "Done":
+                if old_status != "Done" and _blank(merged.get("CompletedAt")):
+                    merged["CompletedAt"] = dt.datetime.now().isoformat(timespec="seconds")
             else:
-                full_visible[c] = full_visible[c].apply(
-                    lambda x: default if x in ("", None) or pd.isna(x) else x
-                )
+                merged["CompletedAt"] = ""
 
-    # Build visible records while preserving original IDs where possible.
-    visible_records = []
-    original_visible = visible.reset_index(drop=True)
+        merged = normalize_record(sheet, merged)
 
-    for i, row in edited.iterrows():
-        rec = row.to_dict()
+        # Only validate rows the user actually changed, so one legacy bad row
+        # cannot block every edit in the table.
+        old_norm = normalize_record(sheet, old) if old else None
+        if old_norm is None or _public(merged) != _public(old_norm):
+            ok, message = validate_record(sheet, merged)
+            if not ok:
+                st.error(message)
+                return
 
-        if i < len(original_visible):
-            original_row = original_visible.iloc[i].to_dict()
-            rec["_id"] = DB[sheet][visible_original_indices[i]].get("_id")
-        else:
-            rec["_id"] = str(uuid.uuid4())
+        new_visible.append(merged)
 
-        for c in schema:
-            if c not in rec:
-                rec[c] = original_row.get(c, "") if i < len(original_visible) else ""
+    hidden = [r for r in DB[sheet] if str(r.get("_id")) not in visible_ids]
+    combined = hidden + new_visible
 
-        if sheet == "Tasks" and str(rec.get("Status", "")) == "Done":
-            old_status = str(original_visible.iloc[i].get("Status", "")) if i < len(original_visible) else ""
-            if old_status != "Done" and not str(rec.get("CompletedAt", "")).strip():
-                rec["CompletedAt"] = dt.datetime.now().isoformat(timespec="seconds")
-        elif sheet == "Tasks" and str(rec.get("Status", "")) != "Done":
-            rec["CompletedAt"] = ""
+    def as_map(rows):
+        return {str(r["_id"]): r for r in serialize_records(sheet, rows)}
 
-        rec = normalize_record(sheet, rec)
-        valid, message = validate_record(sheet, rec)
-        if not valid:
-            st.error(message)
-            return
-        visible_records.append(rec)
-
-    # Reconstruct the entire table from hidden rows + edited visible rows.
-    hidden_records = []
-    hidden_indices = set(full_df.index) - set(visible_original_indices)
-
-    for original_i in sorted(hidden_indices):
-        hidden_records.append(DB[sheet][original_i])
-
-    combined = hidden_records + visible_records
-
-    # For unfiltered editors, this is simply the edited table.
-    if mask is None:
-        combined = visible_records
-
-    if serialize_records(sheet, DB[sheet]) != serialize_records(sheet, combined):
+    if as_map(DB[sheet]) != as_map(combined):
         DB[sheet] = combined
         save_db(DB)
+        st.session_state[ver_key] = ver + 1
+        st.rerun()
 
 
 def serialize_records(sheet: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1327,7 +1403,7 @@ def cleanup_completed_tasks() -> None:
     cutoff = dt.datetime.now() - dt.timedelta(days=7)
     kept = []
     for r in DB["Tasks"]:
-        if str(r.get("Status", "")) == "Done":
+        if str(r.get("Status", "")) == "Done" and _can_modify(r):
             stamp = str(r.get("CompletedAt", "")).strip()
             if stamp:
                 try:
@@ -1431,6 +1507,12 @@ def task_rows(df: pd.DataFrame, key: str) -> None:
             for r in DB["Tasks"]:
                 if r.get("_id") == record_id:
                     r["Status"] = new_status
+                    # keep CompletedAt in sync so the 7-day cleanup works
+                    if new_status == "Done":
+                        if not str(r.get("CompletedAt", "")).strip():
+                            r["CompletedAt"] = dt.datetime.now().isoformat(timespec="seconds")
+                    else:
+                        r["CompletedAt"] = ""
                     break
             save_db(DB)
             st.rerun()
@@ -1456,18 +1538,21 @@ def stat(label: str, value: Any, sub: str = "", pct: int | None = None) -> str:
 def home() -> None:
     df = tasks_df()
     if df.empty:
-        today_df = df
-        overdue = df
+        today_all = today_df = overdue = df
     else:
-        today_df = df[(df["Date"] == TODAY) & (df["Status"] != "Done")]
-        overdue = df[
-            df["Date"].notna()
-            & (df["Date"] < TODAY)
-            & (df["Status"] != "Done")
-        ]
+        today_all = df[df["Date"] == TODAY]
+        today_df = sort_tasks_df(today_all[today_all["Status"] != "Done"])
+        overdue = sort_tasks_df(
+            df[
+                df["Date"].notna()
+                & (df["Date"] < TODAY)
+                & (df["Status"] != "Done")
+            ]
+        )
 
     work = df[df["Area"].isin(["DSA", "Python", "Analytics", "Project", "Work"])] if not df.empty else df
-    done_today = int((today_df["Status"] == "Done").sum()) if not today_df.empty else 0
+    # Done tasks are filtered out of today_df, so count them from today_all.
+    done_today = len(today_all) - len(today_df)
     done_work = int((work["Status"] == "Done").sum()) if not work.empty else 0
 
     greeting = (
@@ -1484,8 +1569,8 @@ def home() -> None:
 
     c = st.columns(4)
     c[0].markdown(
-        stat("Tasks today", f"{done_today}/{len(today_df)}",
-             pct=round(100 * done_today / len(today_df)) if len(today_df) else 0),
+        stat("Tasks today", f"{done_today}/{len(today_all)}",
+             pct=round(100 * done_today / len(today_all)) if len(today_all) else 0),
         unsafe_allow_html=True
     )
     c[1].markdown(
@@ -1550,6 +1635,11 @@ def set_habit(day: dt.date, habit: str, completed: bool) -> None:
     save_db(DB)
 
 
+def _toggle_habit(day: dt.date, habit: str, widget_key: str) -> None:
+    """Checkbox callback: read the widget's real value instead of stale args."""
+    set_habit(day, habit, bool(st.session_state.get(widget_key)))
+
+
 def today_habits() -> None:
     with st.container(border=True):
         st.markdown(f"**✅ Today's habits** · {habit_day_pct(TODAY)}%")
@@ -1564,8 +1654,8 @@ def today_habits() -> None:
                 habit,
                 value=habit in done,
                 key=key,
-                on_change=set_habit,
-                args=(TODAY, habit, not (habit in done)),
+                on_change=_toggle_habit,
+                args=(TODAY, habit, key),
             )
 
 
@@ -1576,7 +1666,7 @@ def _cleanup_reminders() -> None:
     kept = []
     for r in DB["Reminders"]:
         done_at = str(r.get("DoneAt", "")).strip()
-        if done_at:
+        if done_at and _can_modify(r):
             try:
                 done_day = dt.datetime.fromisoformat(done_at).date().isoformat()
                 if done_day < today_key:
@@ -1739,12 +1829,17 @@ def habits() -> None:
             "Done %": habit_day_pct(day),
         })
 
+    # The key changes after every save (and when the habit list changes) so the
+    # grid always re-baselines from the database instead of replaying stale edits.
+    names_key = hashlib.sha1("|".join(names).encode()).hexdigest()[:6]
+    grid_ver = st.session_state.get("habits_grid_v", 0)
+
     ed = st.data_editor(
         pd.DataFrame(rows),
         hide_index=True,
         width="stretch",
         disabled=["Day", "Done %"],
-        key=f"habits_grid",
+        key=f"habits_grid_{grid_ver}_{names_key}",
         column_config={
             "Done %": st.column_config.ProgressColumn(
                 "Done %", min_value=0, max_value=100, format="%d%%"
@@ -1784,6 +1879,8 @@ def habits() -> None:
 
     if changed:
         save_db(DB)
+        st.session_state["habits_grid_v"] = grid_ver + 1
+        st.rerun()
 
     st.markdown("#### Monthly overview")
     month = f"{TODAY:%Y-%m}"
@@ -1823,7 +1920,7 @@ def habits() -> None:
     )
 
     with st.expander("⚙️ Habit settings"):
-        editor("Habits", key=f"habits_settings")
+        editor("Habits", key="habits_settings")
 
 
 def tasks_page() -> None:
@@ -1881,28 +1978,39 @@ def tasks_page() -> None:
 
 @st.dialog("🗺️ Roadmap", width="large")
 def roadmap_dialog(rid: str, title: str) -> None:
-    """Render a Notion-style checklist roadmap.
+    """Notion-style checklist roadmap.
 
     Roadmap records use:
-      Roadmap = roadmap id
-      Heading = section/week
-      Sub = difficulty/sub-section (Easy, Medium, Hard, etc.)
-      Topic = checklist item
-      Done = "1" when completed
-    """
-    rows = [
-        (i, r) for i, r in enumerate(DB["Roadmap"])
-        if r.get("Roadmap") == rid
-    ]
-    items = [(i, r) for i, r in rows if str(r.get("Topic", "")).strip()]
+      Roadmap = roadmap id          Heading = section / week
+      Sub     = level (Easy, ...)   Topic   = checklist item
+      Done    = "1" when completed  Order   = display order
 
-    done = sum(str(r.get("Done", "")) == "1" for _, r in items)
+    Every rerun in here is scoped to the dialog fragment, so ticking a box or
+    adding a topic no longer closes the dialog.
+    """
+
+    def _order(r: dict[str, Any]) -> float:
+        try:
+            return float(r.get("Order") or 1e12)
+        except (TypeError, ValueError):
+            return 1e12
+
+    def _refresh() -> None:
+        st.rerun(scope="fragment")
+
+    rows = sorted(
+        (r for r in DB["Roadmap"] if r.get("Roadmap") == rid),
+        key=_order,
+    )
+    items = [r for r in rows if str(r.get("Topic", "")).strip()]
+
+    done = sum(str(r.get("Done", "")) == "1" for r in items)
     total = len(items)
     pct = round(100 * done / total) if total else 0
 
     headings = list(dict.fromkeys(
         str(r.get("Heading", "")).strip()
-        for _, r in rows
+        for r in rows
         if str(r.get("Heading", "")).strip()
     ))
 
@@ -1919,53 +2027,57 @@ def roadmap_dialog(rid: str, title: str) -> None:
     )
 
     if not headings:
-        st.info("This roadmap is empty. Use **Roadmap settings** below to create your first section.")
+        st.info(
+            "This roadmap is empty. Use **Roadmap settings** below to create a section, "
+            "or run roadmap_convert.sql in Supabase to load the DSA roadmap."
+        )
     else:
-        st.caption("Sections are collapsed by default. Open a section, then open Easy / Medium / Hard to reveal its checklist.")
-        for heading_index, heading in enumerate(headings):
-            heading_items = [
-                (i, r) for i, r in items
-                if str(r.get("Heading", "")).strip() == heading
-            ]
-            heading_done = sum(str(r.get("Done", "")) == "1" for _, r in heading_items)
-            heading_total = len(heading_items)
-            heading_pct = round(100 * heading_done / heading_total) if heading_total else 0
+        # One section at a time keeps the dialog fast (the DSA roadmap alone has
+        # ~800 checkboxes). Widget labels stay constant so open/closed state and
+        # the selection survive a tick.
+        sec_key = f"roadmap_section_{rid}"
+        if st.session_state.get(sec_key) not in headings:
+            st.session_state.pop(sec_key, None)
+        heading = st.selectbox("Section", headings, key=sec_key)
 
-            with st.expander(
-                f"{heading}   ·   {heading_done}/{heading_total}   ·   {heading_pct}%",
-                expanded=False,
-            ):
-                subs = list(dict.fromkeys(
-                    str(r.get("Sub", "")).strip()
-                    for _, r in heading_items
-                    if str(r.get("Sub", "")).strip()
-                ))
-                ordered_subs = [""] + subs
-                for sub_index, sub in enumerate(ordered_subs):
-                    sub_items = [
-                        (i, r) for i, r in heading_items
-                        if str(r.get("Sub", "")).strip() == sub
-                    ]
-                    if not sub_items:
-                        continue
-                    sub_done = sum(str(r.get("Done", "")) == "1" for _, r in sub_items)
-                    sub_label = sub if sub else "Topics"
-                    with st.expander(
-                        f"{sub_label}   ·   {sub_done}/{len(sub_items)}",
-                        expanded=False,
-                    ):
-                        for _, r in sub_items:
-                            rid_key = str(r.get("_id"))
-                            checked = str(r.get("Done", "")) == "1"
-                            value = st.checkbox(
-                                str(r.get("Topic", "")),
-                                value=checked,
-                                key=f"roadmap_topic_{rid}_{rid_key}",
-                            )
-                            if value != checked:
-                                r["Done"] = "1" if value else ""
-                                save_db(DB)
-                                st.rerun()
+        heading_items = [
+            r for r in items if str(r.get("Heading", "")).strip() == heading
+        ]
+        h_done = sum(str(r.get("Done", "")) == "1" for r in heading_items)
+        h_total = len(heading_items)
+        h_pct = round(100 * h_done / h_total) if h_total else 0
+        st.markdown(
+            f'<div class="roadmap-week"><div class="roadmap-week-title">{esc(heading)}</div>'
+            f'<div class="roadmap-week-meta">{h_done}/{h_total} topics · {h_pct}%</div>'
+            f'<div class="roadmap-progress"><div style="width:{h_pct}%"></div></div></div>',
+            unsafe_allow_html=True,
+        )
+
+        subs = list(dict.fromkeys(
+            str(r.get("Sub", "")).strip() for r in heading_items
+        ))
+        # topics without a level first, then levels in their stored order
+        subs.sort(key=lambda s: s != "")
+
+        for sub in subs:
+            sub_items = [
+                r for r in heading_items if str(r.get("Sub", "")).strip() == sub
+            ]
+            sub_done = sum(str(r.get("Done", "")) == "1" for r in sub_items)
+            with st.expander(sub or "Topics", expanded=False):
+                st.caption(f"{sub_done}/{len(sub_items)} completed")
+                for r in sub_items:
+                    topic_id = str(r.get("_id"))
+                    checked = str(r.get("Done", "")) == "1"
+                    value = st.checkbox(
+                        str(r.get("Topic", "")),
+                        value=checked,
+                        key=f"roadmap_topic_{rid}_{topic_id}",
+                    )
+                    if value != checked:
+                        r["Done"] = "1" if value else ""
+                        save_db(DB)
+                        _refresh()
 
     with st.expander("⚙️ Roadmap settings"):
         st.markdown(
@@ -1976,6 +2088,9 @@ def roadmap_dialog(rid: str, title: str) -> None:
             unsafe_allow_html=True,
         )
 
+        used_orders = [_order(r) for r in rows if _order(r) < 1e12]
+        next_order = (max(used_orders) if used_orders else 0) + 1
+
         # ---- Add a new week/section ----
         st.markdown("#### Add week / section")
         new_heading = st.text_input(
@@ -1983,11 +2098,7 @@ def roadmap_dialog(rid: str, title: str) -> None:
             placeholder="e.g. Week 1: Arrays",
             key=f"roadmap_new_heading_{rid}",
         )
-        if st.button(
-            "＋ Add section",
-            key=f"roadmap_add_heading_{rid}",
-            type="primary",
-        ):
+        if st.button("＋ Add section", key=f"roadmap_add_heading_{rid}", type="primary"):
             value = new_heading.strip()
             if not value:
                 st.warning("Enter a section name first.")
@@ -1995,14 +2106,11 @@ def roadmap_dialog(rid: str, title: str) -> None:
                 st.warning("That section already exists.")
             else:
                 DB["Roadmap"].append(normalize_record("Roadmap", {
-                    "Roadmap": rid,
-                    "Heading": value,
-                    "Sub": "",
-                    "Topic": "",
-                    "Done": "",
+                    "Roadmap": rid, "Heading": value, "Sub": "",
+                    "Topic": "", "Done": "", "Order": next_order,
                 }))
                 save_db(DB)
-                st.rerun()
+                _refresh()
 
         if headings:
             st.divider()
@@ -2010,25 +2118,19 @@ def roadmap_dialog(rid: str, title: str) -> None:
             # ---- Add a difficulty/sub-section ----
             st.markdown("#### Add level / sub-section")
             selected_heading = st.selectbox(
-                "Section",
-                headings,
-                key=f"roadmap_manage_heading_{rid}",
+                "Section", headings, key=f"roadmap_manage_heading_{rid}",
             )
             existing_subs = list(dict.fromkeys(
                 str(r.get("Sub", "")).strip()
-                for _, r in rows
+                for r in rows
                 if str(r.get("Heading", "")).strip() == selected_heading
                 and str(r.get("Sub", "")).strip()
             ))
             new_sub = st.text_input(
-                "Level name",
-                placeholder="Easy / Medium / Hard",
+                "Level name", placeholder="Easy / Medium / Hard",
                 key=f"roadmap_new_sub_{rid}",
             )
-            if st.button(
-                "＋ Add level",
-                key=f"roadmap_add_sub_{rid}",
-            ):
+            if st.button("＋ Add level", key=f"roadmap_add_sub_{rid}"):
                 value = new_sub.strip()
                 if not value:
                     st.warning("Enter a level name first.")
@@ -2036,65 +2138,47 @@ def roadmap_dialog(rid: str, title: str) -> None:
                     st.warning("That level already exists in this section.")
                 else:
                     DB["Roadmap"].append(normalize_record("Roadmap", {
-                        "Roadmap": rid,
-                        "Heading": selected_heading,
-                        "Sub": value,
-                        "Topic": "",
-                        "Done": "",
+                        "Roadmap": rid, "Heading": selected_heading, "Sub": value,
+                        "Topic": "", "Done": "", "Order": next_order,
                     }))
                     save_db(DB)
-                    st.rerun()
+                    _refresh()
 
             # ---- Add checklist topics ----
             st.divider()
             st.markdown("#### Add checklist topics")
             selected_sub = st.selectbox(
-                "Level",
-                ["(none)"] + existing_subs,
-                key=f"roadmap_manage_sub_{rid}",
+                "Level", ["(none)"] + existing_subs, key=f"roadmap_manage_sub_{rid}",
             )
             topics = st.text_area(
                 "Topics — one per line",
-                placeholder=(
-                    "Two Sum\n"
-                    "Best Time to Buy and Sell Stock\n"
-                    "Contains Duplicate"
-                ),
+                placeholder="Two Sum\nBest Time to Buy and Sell Stock\nContains Duplicate",
                 height=150,
                 key=f"roadmap_topics_{rid}",
             )
-            if st.button(
-                "＋ Add topics",
-                key=f"roadmap_add_topics_{rid}",
-            ):
-                topic_values = [
-                    line.strip() for line in topics.splitlines()
-                    if line.strip()
-                ]
+            if st.button("＋ Add topics", key=f"roadmap_add_topics_{rid}"):
+                topic_values = [t.strip() for t in topics.splitlines() if t.strip()]
                 if not topic_values:
                     st.warning("Add at least one topic.")
                 else:
-                    new_rows = [
+                    DB["Roadmap"].extend(
                         normalize_record("Roadmap", {
                             "Roadmap": rid,
                             "Heading": selected_heading,
                             "Sub": "" if selected_sub == "(none)" else selected_sub,
-                            "Topic": topic,
-                            "Done": "",
+                            "Topic": topic, "Done": "",
+                            "Order": next_order + n,
                         })
-                        for topic in topic_values
-                    ]
-                    DB["Roadmap"].extend(new_rows)
+                        for n, topic in enumerate(topic_values)
+                    )
                     save_db(DB)
-                    st.rerun()
+                    _refresh()
 
             # ---- Delete an entire section ----
             st.divider()
             st.markdown("#### Delete section")
             delete_heading = st.selectbox(
-                "Section to delete",
-                headings,
-                key=f"roadmap_delete_select_{rid}",
+                "Section to delete", headings, key=f"roadmap_delete_select_{rid}",
             )
             if st.button(
                 f'🗑️ Delete "{delete_heading}" and its topics',
@@ -2108,7 +2192,7 @@ def roadmap_dialog(rid: str, title: str) -> None:
                     )
                 ]
                 save_db(DB)
-                st.rerun()
+                _refresh()
 
 
 def study(area: str, rid: str, title: str) -> None:
@@ -2274,14 +2358,17 @@ def week() -> None:
         if df.empty:
             x = df
         else:
-            x = df[
-                (df["Date"] == day)
-                & (df["Status"] != "Done")
-            ].sort_values("Start", na_position="last")
+            # Chronological within the day; untimed tasks go to the bottom.
+            x = sort_tasks_df(df[(df["Date"] == day) & (df["Status"] != "Done")])
 
         body_parts = []
         for _, r in x.iterrows():
-            time_text = str(r["Start"])[:5] if pd.notna(r["Start"]) and r["Start"] else "any time"
+            if pd.notna(r["Start"]) and r["Start"]:
+                time_text = str(r["Start"])[:5]
+                if pd.notna(r["End"]) and r["End"]:
+                    time_text += f"–{str(r['End'])[:5]}"
+            else:
+                time_text = "any time"
             body_parts.append(
                 f'<p style="--c:{COLORS.get(str(r["Area"]), "#7c5cff")}">'
                 f'<b>{esc(str(r["Task"]))}</b><br>'
@@ -2308,6 +2395,19 @@ def export_excel() -> bytes:
                 writer, sheet_name=sheet[:31], index=False
             )
     return output.getvalue()
+
+
+def cached_excel() -> bytes | None:
+    """Build the backup only when the data changed (not on every rerun)."""
+    version = st.session_state.get("_db_version", 0)
+    if st.session_state.get("_xlsx_ver") != version:
+        try:
+            st.session_state["_xlsx_bytes"] = export_excel()
+        except Exception as exc:  # e.g. openpyxl not installed
+            st.session_state["_xlsx_bytes"] = None
+            st.session_state["_xlsx_error"] = str(exc)
+        st.session_state["_xlsx_ver"] = version
+    return st.session_state.get("_xlsx_bytes")
 
 
 # =============================================================================
@@ -2352,14 +2452,24 @@ with st.sidebar:
         st.session_state.clear()
         st.rerun()
 
-    st.download_button(
-        "↓  Export Excel backup",
-        data=export_excel(),
-        file_name=f"tracker_{USER}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        width="stretch",
-    )
+    xlsx = cached_excel()
+    if xlsx:
+        st.download_button(
+            "↓  Export Excel backup",
+            data=xlsx,
+            file_name=f"tracker_{USER}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+        )
+    else:
+        st.caption("Excel export unavailable: add 'openpyxl' to requirements.txt.")
     st.caption("☁  Supabase cloud storage")
 
+
+if st.session_state.pop("_blocked_notice", False):
+    st.toast(
+        "Shared admin records are read-only for your account, so those changes were not saved.",
+        icon="🔒",
+    )
 
 PAGES[page]()
