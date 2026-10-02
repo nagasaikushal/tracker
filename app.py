@@ -1976,6 +1976,15 @@ def tasks_page() -> None:
         st.markdown('<div class="completed-list">'+''.join(rows)+'</div>', unsafe_allow_html=True)
 
 
+# Roadmap rows whose Topic starts with this marker are guidance notes: shown as
+# plain text (no checkbox) and left out of every progress count.
+ROADMAP_NOTE_PREFIX = "📝 "
+
+
+def _is_note(r: dict[str, Any]) -> bool:
+    return str(r.get("Topic", "")).startswith(ROADMAP_NOTE_PREFIX)
+
+
 @st.dialog("🗺️ Roadmap", width="large")
 def roadmap_dialog(rid: str, title: str) -> None:
     """Notion-style checklist roadmap.
@@ -2002,7 +2011,8 @@ def roadmap_dialog(rid: str, title: str) -> None:
         (r for r in DB["Roadmap"] if r.get("Roadmap") == rid),
         key=_order,
     )
-    items = [r for r in rows if str(r.get("Topic", "")).strip()]
+    topic_rows = [r for r in rows if str(r.get("Topic", "")).strip()]
+    items = [r for r in topic_rows if not _is_note(r)]      # checkable only
 
     done = sum(str(r.get("Done", "")) == "1" for r in items)
     total = len(items)
@@ -2040,9 +2050,10 @@ def roadmap_dialog(rid: str, title: str) -> None:
             st.session_state.pop(sec_key, None)
         heading = st.selectbox("Section", headings, key=sec_key)
 
-        heading_items = [
-            r for r in items if str(r.get("Heading", "")).strip() == heading
+        heading_rows = [
+            r for r in topic_rows if str(r.get("Heading", "")).strip() == heading
         ]
+        heading_items = [r for r in heading_rows if not _is_note(r)]
         h_done = sum(str(r.get("Done", "")) == "1" for r in heading_items)
         h_total = len(heading_items)
         h_pct = round(100 * h_done / h_total) if h_total else 0
@@ -2054,19 +2065,27 @@ def roadmap_dialog(rid: str, title: str) -> None:
         )
 
         subs = list(dict.fromkeys(
-            str(r.get("Sub", "")).strip() for r in heading_items
+            str(r.get("Sub", "")).strip() for r in heading_rows
         ))
         # topics without a level first, then levels in their stored order
         subs.sort(key=lambda s: s != "")
 
         for sub in subs:
-            sub_items = [
-                r for r in heading_items if str(r.get("Sub", "")).strip() == sub
+            sub_rows = [
+                r for r in heading_rows if str(r.get("Sub", "")).strip() == sub
             ]
+            sub_items = [r for r in sub_rows if not _is_note(r)]
             sub_done = sum(str(r.get("Done", "")) == "1" for r in sub_items)
             with st.expander(sub or "Topics", expanded=False):
-                st.caption(f"{sub_done}/{len(sub_items)} completed")
-                for r in sub_items:
+                if sub_items:
+                    st.caption(f"{sub_done}/{len(sub_items)} completed")
+                for r in sub_rows:
+                    if _is_note(r):
+                        st.markdown(
+                            f'<p class="roadmap-help">📝 {esc(str(r.get("Topic", ""))[len(ROADMAP_NOTE_PREFIX):])}</p>',
+                            unsafe_allow_html=True,
+                        )
+                        continue
                     topic_id = str(r.get("_id"))
                     checked = str(r.get("Done", "")) == "1"
                     value = st.checkbox(
@@ -2198,7 +2217,10 @@ def roadmap_dialog(rid: str, title: str) -> None:
 def study(area: str, rid: str, title: str) -> None:
     # Roadmap is intentionally closed by default. Clicking Open launches the
     # roadmap as a right-side dialog instead of consuming the whole page.
-    rows = [r for r in DB["Roadmap"] if r.get("Roadmap") == rid and str(r.get("Topic", "")).strip()]
+    rows = [
+        r for r in DB["Roadmap"]
+        if r.get("Roadmap") == rid and str(r.get("Topic", "")).strip() and not _is_note(r)
+    ]
     done = sum(str(r.get("Done", "")) == "1" for r in rows)
     total = len(rows)
     pct = round(100 * done / total) if total else 0
